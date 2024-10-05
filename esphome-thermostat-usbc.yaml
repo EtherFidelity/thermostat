@@ -1,0 +1,647 @@
+substitutions:
+  name_of_device: "usb-thermostat"
+  name_of_thermostat: "Bedroom"
+  default_low_target_temp_f: '58'
+  default_high_target_temp_f: '82'
+  min_temperature_f: '45'
+  max_temperature_f: '90'
+  topic_current_temp: "Devices/Air-Conditioners/Bedroom/current_temperature"
+  topic_target_mode: "Devices/Air-Conditioners/Bedroom/target_mode"
+
+esphome:
+  name: $name_of_device
+  friendly_name: "${name_of_thermostat} Thermostat"
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: screen_on
+      - script.execute: commit_displayed_state
+
+external_components:
+  - source: github://mcmanigle/esphome-components
+    components: [qwiic_twist]
+    refresh: 0s
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: "[redacted]"
+
+ota:
+  password: "[redacted]"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "${name_of_device} Fallback AP"
+    password: "[redacted]"
+
+mqtt:
+  broker: iris.nest.etherfi.net
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+  reboot_timeout: 0s
+  topic_prefix: null
+  discovery: false
+  log_topic: null
+
+captive_portal:
+
+web_server:
+  port: 80
+
+switch:
+  - platform: template
+    id: keep_backlight_on
+    name: "Keep Backlight On"
+    optimistic: true
+    turn_on_action:
+      lambda: |-
+        id(screen_turns_off) = false;
+        if (id(screen_on).is_running()) {
+          return;
+        } else {
+          id(oled).turn_on();
+          id(oled).set_contrast(0);
+        }
+    turn_off_action:
+      lambda: |-
+        id(screen_turns_off) = true;
+        if (id(screen_on).is_running()) {
+          return;
+        } else {
+          id(oled).turn_off();
+        }
+
+  - platform: template
+    id: disable_operation
+    name: "Disable A/C Control"
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(allow_operation) = false;
+    turn_off_action:
+      - lambda: |-
+          id(allow_operation) = true;
+
+i2c:
+  - id: qwiic
+    sda: 22
+    scl: 19
+    frequency: 800kHz
+
+  - id: soldered
+    sda: 4
+    scl: 33
+    frequency: 800kHz
+
+display:
+  - platform: ssd1306_i2c
+    id: oled
+    model: "SSD1306 128x64"
+    rotation: 180
+    i2c_id: soldered
+
+    # ----- No changes should be needed below this line -----
+
+    update_interval: 0.1s
+    lambda: |-
+      float temperature_f = 0;
+      double temp_whole_f = 0;
+      double temp_fraction_f = 0;
+      int temp_tenths_f = 0;
+
+      // Grey out a rectangular area
+      int mod_offset = 0;
+      #define gray_out_rectangle(t, l, tt, ll) \
+        for (int line = l; line < l+ll; line++) { \
+          mod_offset = (mod_offset) ? 0 : 1; \
+          for (int column = t; column < t+tt; column++) { \
+            if ((column + mod_offset) % 2) it.draw_pixel_at(column, line, COLOR_OFF); \
+          } \
+        }
+
+      // Header
+      it.print(1, 0, id(g_8), "${name_of_thermostat}");
+      if (id(fan_running)) it.image(118, 0, id(fan));
+
+      // Horizontal Lines
+      it.line(0, 10, 127, 10);
+      it.line(0, 50, 127, 50);
+
+      // Vertical lines
+      it.line(42, 51, 42, 63);
+      it.line(85, 51, 85, 63);
+
+      // Inside temperature
+      it.printf(0, 8, id(spleen_32), "%3d", id(temp_whole));
+      it.print(47, 13, id(spleen_12), "°F");
+      it.print(42, 8, id(spleen_32), ".");
+      it.printf(53, 25, id(spleen_12), "%.1d", id(temp_tenths));
+
+      // Outside temperature
+      it.image(6, 37, id(door));
+      it.printf(22, 37, id(spleen_12), "%3.1f", id(internal_temp).state);
+      it.print(47, 37, id(spleen_12), "°F");
+
+      // Target cool temperature
+      it.print(68, 13, id(spleen_12), "Cool");
+      it.printf(71, 22, id(spleen_16), "%2.0f", id(target_high_temperature_displayed_f));
+      if ((id(ac_mode_displayed) != CLIMATE_MODE_COOL) &&
+          (id(ac_mode_displayed) != CLIMATE_MODE_HEAT_COOL)) {
+        gray_out_rectangle(68, 13, 22, 22);
+      }
+
+      // Target heat temperature
+      it.print(98, 13, id(spleen_12), "Heat");
+      it.printf(101, 22, id(spleen_16), "%2.0f", id(target_low_temperature_displayed_f));
+      if ((id(ac_mode_displayed) != CLIMATE_MODE_HEAT) &&
+          (id(ac_mode_displayed) != CLIMATE_MODE_HEAT_COOL)) {
+        gray_out_rectangle(98, 13, 22, 22);
+      }
+
+      // Current Operation
+      if (id(tstat).action == CLIMATE_ACTION_OFF)
+        it.print(86, 37, id(spleen_12), "Off");
+      else if (id(tstat).action == CLIMATE_ACTION_IDLE)
+        it.print(82, 37, id(spleen_12), "Idle");
+      else if (id(tstat).action == CLIMATE_ACTION_COOLING)
+        it.print(73, 37, id(spleen_12), "Cooling");
+      else if (id(tstat).action == CLIMATE_ACTION_HEATING)
+        it.print(73, 37, id(spleen_12), "Heating");
+
+      // Left box
+      if (id(ac_mode_displayed) == CLIMATE_MODE_OFF) {
+        it.filled_rectangle(11, 53, 20, 9);
+        it.print(12, 54, id(g_8), COLOR_OFF, "Off");
+      } else {
+        it.print(12, 54, id(g_8), "Off");
+      }
+
+      // Center box
+      if ((id(ac_mode_displayed) == CLIMATE_MODE_COOL) ||
+          (id(ac_mode_displayed) == CLIMATE_MODE_HEAT_COOL)) {
+        it.filled_rectangle(50, 53, 28, 9);
+        it.print(51, 54, id(g_8), COLOR_OFF, "Cool");
+      } else {
+        it.print(51, 54, id(g_8), "Cool");
+      }
+
+      // Right box
+      if ((id(ac_mode_displayed) == CLIMATE_MODE_HEAT) ||
+          (id(ac_mode_displayed) == CLIMATE_MODE_HEAT_COOL)) {
+        it.filled_rectangle(93, 53, 27, 9);
+        it.print(94, 54, id(g_8), COLOR_OFF, "Heat");
+      } else {
+        it.print(94, 54, id(g_8), "Heat");
+      }
+
+      // Mode selection box
+      if (id(selected_item) == 1)
+        it.rectangle(1, 52, 126, 11);
+
+      // Target cool temperature selection box
+      if (id(selected_item) == 2)
+        it.rectangle(66, 12, 26, 24);
+
+      // Target heat temperature selection box
+      if (id(selected_item) == 3)
+        it.rectangle(96, 12, 26, 24);
+
+image:
+  - file: "fan.png"
+    id: fan
+  - file: "door.png"
+    id: door
+
+font:
+  - file: 'Graph35.ttf'
+    size: 8
+    id: g_8
+  - file: 'Graph35.ttf'
+    size: 12
+    id: g_12
+  - file: 'Graph35.ttf'
+    size: 16
+    id: g_16
+  - file: 'spleen-6x12.bdf'
+    id: spleen_12
+  - file: 'spleen-8x16.bdf'
+    id: spleen_16
+  - file: 'spleen-16x32.bdf'
+    id: spleen_32
+
+globals:
+  - id: target_low_temperature_displayed_f
+    type: float
+    restore_value: no
+    initial_value: $default_low_target_temp_f
+
+  - id: target_high_temperature_displayed_f
+    type: float
+    restore_value: no
+    initial_value: $default_high_target_temp_f
+
+  - id: ac_mode_displayed
+    type: ClimateMode
+    restore_value: no
+    initial_value: CLIMATE_MODE_OFF  # Uses the ClimateMode enum values. https://esphome.io/api/namespaceesphome_1_1climate
+
+  - id: selected_item
+    type: int
+    restore_value: no
+    initial_value: '99'  # 0 = Nothing, 1 = Mode bar, 2 = Target high (cool) temp, 3 = Target low (heat) temp, 99 = Just booted
+
+  - id: temp_whole
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: temp_tenths
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: fan_running
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: screen_turns_off
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: allow_operation
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: ac_running
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+script:
+  - id: publish_follow_me_temperature
+    mode: single
+    then:
+      - delay: 30s
+      - if:
+          condition:
+            - lambda: 'return id(ac_running);'
+          then:
+            - mqtt.publish:
+                topic: ${topic_current_temp}
+                payload: !lambda 'return to_string(id(internal_temp).state);'
+
+  - id: set_mode_low_cooling
+    then:
+      - if:
+          condition:
+            - lambda: 'return id(allow_operation);'
+          then:
+            - lambda: 'id(ac_running) = true;'
+            - mqtt.publish:
+                topic: ${topic_target_mode}
+                payload: "low_cooling"
+
+  - id: set_mode_high_cooling
+    then:
+      - if:
+          condition:
+            - lambda: 'return id(allow_operation);'
+          then:
+            - lambda: 'id(ac_running) = true;'
+            - mqtt.publish:
+                topic: ${topic_target_mode}
+                payload: "high_cooling"
+
+  - id: set_mode_low_heating
+    then:
+      - if:
+          condition:
+            - lambda: 'return id(allow_operation);'
+          then:
+            - lambda: 'id(ac_running) = true;'
+            - mqtt.publish:
+                topic: ${topic_target_mode}
+                payload: "low_heating"
+
+  - id: set_mode_high_heating
+    then:
+      - if:
+          condition:
+            - lambda: 'return id(allow_operation);'
+          then:
+            - lambda: 'id(ac_running) = true;'
+            - mqtt.publish:
+                topic: ${topic_target_mode}
+                payload: "high_heating"
+
+  - id: set_mode_idle
+    then:
+      - if:
+          condition:
+            - and:
+              - lambda: 'return id(ac_running);'
+              - lambda: 'return id(allow_operation);'
+          then:
+            - mqtt.publish:
+                topic: ${topic_target_mode}
+                payload: "idling"
+
+  - id: set_mode_off
+    then:
+      - if:
+          condition:
+            - lambda: 'return id(allow_operation);'
+          then:
+            - lambda: 'id(ac_running) = false;'
+            - mqtt.publish:
+                topic: ${topic_target_mode}
+                payload: "off"
+
+  - id: blink_mode_select
+    mode: restart
+    then:
+      - lambda: id(selected_item) = 99;
+      - delay: 0.2s
+      - lambda: id(selected_item) = 1;
+
+  - id: commit_displayed_state_delayed
+    mode: restart
+    then:
+      - delay: 3s
+      - script.execute: commit_displayed_state
+
+  - id: commit_displayed_state
+    then:
+      - lambda: |-
+          auto mode_call = id(tstat).make_call();
+          auto low_temp_call = id(tstat).make_call();
+          auto high_temp_call = id(tstat).make_call();
+
+          mode_call.set_mode(id(ac_mode_displayed));
+          low_temp_call.set_target_temperature_low((id(target_low_temperature_displayed_f) - 32.0) * (5.0/9.0));
+          high_temp_call.set_target_temperature_high((id(target_high_temperature_displayed_f) - 32.0) * (5.0/9.0));
+
+          mode_call.perform();
+          low_temp_call.perform();
+          high_temp_call.perform();
+
+          id(selected_item) = 0;
+
+  - id: screen_on
+    mode: restart
+    then:
+      - lambda: id(oled).turn_on();
+      - lambda: id(oled).set_contrast(255);
+      - delay: 5s
+      - lambda: id(oled).set_contrast(0);
+      - delay: 3s
+      - lambda: if (id(screen_turns_off)) id(oled).turn_off();
+
+  - id: update_indoor_temp_display
+    then:
+      script.execute: publish_follow_me_temperature
+
+  - id: send_current_temperature
+    then:
+      lambda: |-
+        float temperature = id(internal_temp).state * (9.0/5.0) + 32.0;
+        double tw = 0;
+        double temp_fraction = modf(temperature, &tw);
+        id(temp_whole) = tw;
+        id(temp_tenths) = temp_fraction * 10;
+
+sensor:
+  - platform: htu21d
+    i2c_id: qwiic
+    update_interval: 10s
+    temperature:
+      name: "Temperature"
+      id: internal_temp
+      on_value:
+        then:
+          - script.execute: send_current_temperature
+          - script.execute: update_indoor_temp_display
+      filters:
+      - lambda: return x - 2.77;
+    humidity:
+      name: "Humidity"
+      id: internal_humidity
+
+qwiic_twist:
+  i2c_id: qwiic
+  encoder:
+    id: twist_encoder
+    name: "Twist Encoder"
+    internal: true
+    on_clockwise:
+      - script.execute: screen_on
+      - lambda: |-
+          if (id(selected_item) == 0) return;
+          id(commit_displayed_state_delayed).execute();
+
+          switch (id(selected_item)) {
+            case 1: // Mode selection
+              if (id(ac_mode_displayed) == CLIMATE_MODE_OFF) {
+                id(ac_mode_displayed) = CLIMATE_MODE_COOL;
+                return;
+              }
+              if (id(ac_mode_displayed) == CLIMATE_MODE_COOL) {
+                id(ac_mode_displayed) = CLIMATE_MODE_HEAT;
+                return;
+              }
+              if (id(ac_mode_displayed) == CLIMATE_MODE_HEAT) {
+                id(ac_mode_displayed) = CLIMATE_MODE_HEAT_COOL;
+                return;
+              }
+              id(ac_mode_displayed) = CLIMATE_MODE_OFF;
+              return;
+              break;
+            case 2: // Cooling setpoint
+              if (id(target_high_temperature_displayed_f) >= ${max_temperature_f}) {
+                id(target_high_temperature_displayed_f) = ${max_temperature_f};
+                return;
+              }
+              if (id(target_high_temperature_displayed_f) < ${max_temperature_f}) {
+                id(target_high_temperature_displayed_f)++;
+                return;
+              }
+              break;
+            case 3: // Heating setpoint
+              if (id(target_low_temperature_displayed_f) >= ${max_temperature_f}) {
+                id(target_low_temperature_displayed_f) = ${max_temperature_f};
+                return;
+              }
+              if (id(target_low_temperature_displayed_f) < ${max_temperature_f}) {
+                id(target_low_temperature_displayed_f)++;
+                return;
+              }
+              break;
+          }
+
+    on_anticlockwise:
+      - script.execute: screen_on
+      - lambda: |-
+          if (id(selected_item) == 0) return;
+          id(commit_displayed_state_delayed).execute();
+
+          switch (id(selected_item)) {
+            case 1: // Mode selection
+              if (id(ac_mode_displayed) == CLIMATE_MODE_OFF) {
+                id(ac_mode_displayed) = CLIMATE_MODE_HEAT_COOL;
+                return;
+              }
+              if (id(ac_mode_displayed) == CLIMATE_MODE_HEAT_COOL) {
+                id(ac_mode_displayed) = CLIMATE_MODE_HEAT;
+                return;
+              }
+              if (id(ac_mode_displayed) == CLIMATE_MODE_HEAT) {
+                id(ac_mode_displayed) = CLIMATE_MODE_COOL;
+                return;
+              }
+              id(ac_mode_displayed) = CLIMATE_MODE_OFF;
+              return;
+              break;
+            case 2: // Cooling setpoint
+              if (id(target_high_temperature_displayed_f) <= ${min_temperature_f}) {
+                id(target_high_temperature_displayed_f) = ${min_temperature_f};
+                return;
+              }
+              if (id(target_high_temperature_displayed_f) > ${min_temperature_f}) {
+                id(target_high_temperature_displayed_f)--;
+                return;
+              }
+              break;
+            case 3: // Heating setpoint
+              if (id(target_low_temperature_displayed_f) <= ${min_temperature_f}) {
+                id(target_low_temperature_displayed_f) = ${min_temperature_f};
+                return;
+              }
+              if (id(target_low_temperature_displayed_f) > ${min_temperature_f}) {
+                id(target_low_temperature_displayed_f)--;
+                return;
+              }
+              break;
+          }
+
+  button:
+    id: twist_button
+    name: "Twist Button"
+    internal: true
+    on_press:
+      - script.execute: screen_on
+      - lambda: |-
+          id(commit_displayed_state_delayed).execute();
+
+          switch (id(selected_item)) {
+            case 0:
+              id(selected_item) = 1;
+              return;
+              break;
+
+            case 1:
+              if ((id(ac_mode_displayed) == CLIMATE_MODE_COOL) ||
+                  (id(ac_mode_displayed) == CLIMATE_MODE_HEAT_COOL)) {
+                id(selected_item) = 2;
+                return;
+              }
+
+              if (id(ac_mode_displayed) == CLIMATE_MODE_HEAT) {
+                id(selected_item) = 3;
+                return;
+              }
+
+              id(blink_mode_select).execute();
+              return;
+              break;
+
+            case 2:
+              if ((id(ac_mode_displayed) == CLIMATE_MODE_HEAT) ||
+                  (id(ac_mode_displayed) == CLIMATE_MODE_HEAT_COOL)) {
+                id(selected_item) = 3;
+                return;
+              } else {
+                id(selected_item) = 1;
+                return;
+              }
+              break;
+
+            case 99:
+              return;
+              break;
+
+            default:
+              id(selected_item) = 1;
+              return;
+              break;
+          }
+
+light:
+  - platform: qwiic_twist
+    id: twist_rgb
+    name: "Knob Backlight"
+
+climate:
+  platform: thermostat
+  id: tstat
+  name: Control
+  sensor: internal_temp
+  on_boot_restore_from: default_preset
+  min_cooling_off_time: 0s
+  min_cooling_run_time: 0s
+  #max_cooling_run_time: 0s
+  min_heating_off_time: 0s
+  min_heating_run_time: 0s
+  #max_heating_run_time: 0s
+  min_idle_time: 0s
+
+  #supplemental_cooling_delta: 4.0
+  #supplemental_heating_delta: 4.0
+
+  cool_deadband: 0.5 °F
+  cool_overrun: -0.3 °F
+  heat_deadband: 0.5 °F
+  heat_overrun: -0.3 °F
+
+  visual:
+    min_temperature: $min_temperature_f °F
+    max_temperature: $max_temperature_f °F
+    temperature_step:
+      current_temperature: 0.1
+      target_temperature: 1
+
+  cool_action:
+    - script.execute: set_mode_low_cooling
+  #supplemental_cooling_action:
+  #  - script.execute: set_mode_high_cooling
+  heat_action:
+    - script.execute: set_mode_low_heating
+  #supplemental_heating_action:
+  #  - script.execute: set_mode_high_heating
+  idle_action:
+    - script.execute: set_mode_idle
+  off_mode:
+      - script.execute: set_mode_off
+
+  on_state:
+    - lambda: |-
+        if (id(selected_item) != 0) return;
+        id(ac_mode_displayed) = x.mode;
+        id(target_low_temperature_displayed_f) = (x.target_temperature_low * (9.0/5.0)) + 32.0;
+        id(target_high_temperature_displayed_f) = (x.target_temperature_high * (9.0/5.0)) + 32.0;
